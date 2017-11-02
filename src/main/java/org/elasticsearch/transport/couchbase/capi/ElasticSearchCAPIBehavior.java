@@ -13,19 +13,14 @@
  */
 package org.elasticsearch.transport.couchbase.capi;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Map.Entry;
-import java.util.UUID;
-
-import javax.servlet.UnavailableException;
-
-import org.codehaus.jackson.map.ObjectMapper;
+import com.codahale.metrics.Meter;
+import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.Timer;
+import com.codahale.metrics.json.MetricsModule;
+import com.couchbase.capi.CAPIBehavior;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.base.Stopwatch;
+import com.google.common.cache.Cache;
 import org.elasticsearch.action.ListenableActionFuture;
 import org.elasticsearch.action.admin.indices.exists.indices.IndicesExistsRequestBuilder;
 import org.elasticsearch.action.admin.indices.exists.indices.IndicesExistsResponse;
@@ -45,16 +40,34 @@ import org.elasticsearch.action.index.IndexRequestBuilder;
 import org.elasticsearch.action.index.IndexResponse;
 import org.elasticsearch.client.Client;
 import org.elasticsearch.common.Base64;
-import com.google.common.cache.Cache;
 import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.metrics.CounterMetric;
 import org.elasticsearch.common.metrics.MeanMetric;
 
-import com.couchbase.capi.CAPIBehavior;
+import javax.servlet.UnavailableException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+import static java.util.concurrent.TimeUnit.NANOSECONDS;
+import static java.util.concurrent.TimeUnit.SECONDS;
 
 public class ElasticSearchCAPIBehavior implements CAPIBehavior {
 
-    protected ObjectMapper mapper = new ObjectMapper();
+    private final AtomicLong nextRequestId = new AtomicLong();
+    private final MetricRegistry metricRegistry = new MetricRegistry();
+    private final Meter tooManyConcurrentRequestsMeter = metricRegistry.meter("tooManyConcurrentRequests");
+    private final Timer bulkDocsTimer = metricRegistry.timer("bulkDocs");
+    private final Timer revsDiffTimer = metricRegistry.timer("revsDiff");
+
     protected Client client;
     protected ESLogger logger;
 
@@ -137,397 +150,413 @@ public class ElasticSearchCAPIBehavior implements CAPIBehavior {
     }
 
     @Override
-    public Map<String, Object> revsDiff(String database,
-            Map<String, Object> revsMap)  throws UnavailableException {
-        // check to see if too many requests are already active
-        if(activeBulkDocsRequests.count() + activeRevsDiffRequests.count() >= pluginSettings.getMaxConcurrentRequests()) {
-            totalTooManyConcurrentRequestsErrors.inc();
-            logger.error("Too many concurrent requests. _bulk_docs requests: {}, _revs_diff requests: {}, Max configured: {}",
-                    activeBulkDocsRequests.count(),
-                    activeRevsDiffRequests.count(),
-                    pluginSettings.getMaxConcurrentRequests());
-            throw new UnavailableException("Too many concurrent requests");
-        }
+    public Map<String, Object> revsDiff(String database, Map<String, Object> revsMap)  throws UnavailableException {
+        throwIfTooManyConcurrentRequests();
 
-        long start = System.currentTimeMillis();
+        final long requestId = nextRequestId();
+        Stopwatch stopwatch = Stopwatch.createStarted();
         activeRevsDiffRequests.inc();
-        logger.trace("_revs_diff request for {} : {}", database, revsMap);
+        try {
+            logger.debug("enter revsDiff requestId={} database={}", requestId, database);
+            logger.trace("_revs_diff request for {} : {}", database, revsMap);
 
-        // start with all entries in the response map
-        Map<String, Object> responseMap = new HashMap<String, Object>();
-        for (Entry<String, Object> entry : revsMap.entrySet()) {
-            String id = entry.getKey();
-            String revs = (String)entry.getValue();
-            Map<String, String> rev = new HashMap<String, String>();
-            rev.put("missing", revs);
-            responseMap.put(id, rev);
-        }
-        logger.trace("_revs_diff response for {} is: {}", database, responseMap);
+            // start with all entries in the response map
+            Map<String, Object> responseMap = new HashMap<String, Object>();
+            for (Entry<String, Object> entry : revsMap.entrySet()) {
+                String id = entry.getKey();
+                String revs = (String) entry.getValue();
+                Map<String, String> rev = new HashMap<String, String>();
+                rev.put("missing", revs);
+                responseMap.put(id, rev);
+            }
+            logger.trace("_revs_diff response for {} is: {}", database, responseMap);
 
-        // if resolve conflicts mode is enabled
-        // perform a multi-get query to find information
-        // about revisions we already have
-        if (pluginSettings.getResolveConflicts()) {
-            String index = getElasticSearchIndexNameFromDatabase(database);
-            // the following debug code is verbose in the hopes of better understanding CBES-13
-            MultiGetResponse response = null;
-            if(client != null) {
-                MultiGetRequestBuilder builder = client.prepareMultiGet();
-                if(builder != null) {
-                    if(index == null) {
-                        logger.debug("index is null");
-                    }
-                    int added = 0;
-                    for (String id : responseMap.keySet()) {
-                        String type = pluginSettings.getTypeSelector().getType(index, id);
-                        if(pluginSettings.getDocumentTypeRoutingFields() != null && pluginSettings.getDocumentTypeRoutingFields().containsKey(type)) {
-                            // if this type requires special routing, we can't find it without the doc body
-                            // so we skip this id in the lookup to avoid errors
-                            continue;
+            // if resolve conflicts mode is enabled
+            // perform a multi-get query to find information
+            // about revisions we already have
+            if (pluginSettings.getResolveConflicts()) {
+                String index = getElasticSearchIndexNameFromDatabase(database);
+                // the following debug code is verbose in the hopes of better understanding CBES-13
+                MultiGetResponse response = null;
+                if (client != null) {
+                    MultiGetRequestBuilder builder = client.prepareMultiGet();
+                    if (builder != null) {
+                        if (index == null) {
+                            logger.debug("index is null");
                         }
-                        builder = builder.add(index, type, id);
-                        added++;
-                    }
-                    if(builder != null) {
-                        if(added > 0) {
-                            ListenableActionFuture<MultiGetResponse> laf = builder.execute();
-                            if(laf != null) {
-                                response = laf.actionGet();
+                        int added = 0;
+                        for (String id : responseMap.keySet()) {
+                            String type = pluginSettings.getTypeSelector().getType(index, id);
+                            if (pluginSettings.getDocumentTypeRoutingFields() != null && pluginSettings.getDocumentTypeRoutingFields().containsKey(type)) {
+                                // if this type requires special routing, we can't find it without the doc body
+                                // so we skip this id in the lookup to avoid errors
+                                continue;
+                            }
+                            builder = builder.add(index, type, id);
+                            added++;
+                        }
+                        if (builder != null) {
+                            if (added > 0) {
+                                ListenableActionFuture<MultiGetResponse> laf = builder.execute();
+                                if (laf != null) {
+                                    response = laf.actionGet();
+                                } else {
+                                    logger.debug("laf was null");
+                                }
                             } else {
-                                logger.debug("laf was null");
+                                logger.debug("skipping multiget, no documents to look for");
                             }
                         } else {
-                            logger.debug("skipping multiget, no documents to look for");
+                            logger.debug("builder was null 2");
                         }
                     } else {
-                        logger.debug("builder was null 2");
+                        logger.debug("builder was null");
                     }
                 } else {
-                    logger.debug("builder was null");
+                    logger.debug("client was null");
                 }
-            } else {
-                logger.debug("client was null");
-            }
-            if(response != null) {
-                Iterator<MultiGetItemResponse> iterator = response.iterator();
-                while(iterator.hasNext()) {
-                    MultiGetItemResponse item = iterator.next();
-                    if(item.isFailed()) {
-                        logger.warn("_revs_diff get failure on index: {} id: {} message: {}", item.getIndex(), item.getId(), item.getFailure().getMessage());
-                    } else {
-                        if(item.getResponse().isExists()) {
-                            String itemId = item.getId();
-                            Map<String, Object> source = item.getResponse().getSourceAsMap();
-                            if(source != null) {
-                                Map<String, Object> meta = (Map<String, Object>)source.get("meta");
-                                if(meta != null) {
-                                    String rev = (String)meta.get("rev");
-                                    //retrieve the revision passed in from Couchbase
-                                    Map<String, String> sourceRevMap = (Map<String, String>)responseMap.get(itemId);
-                                    String sourceRev = sourceRevMap.get("missing");
-                                    if(rev.equals(sourceRev)) {
-                                        // if our revision is the same as the source rev
-                                        // remove it from the response map
-                                        responseMap.remove(itemId);
-                                        logger.trace("_revs_diff already have id: {} rev: {}", itemId, rev);
+                if (response != null) {
+                    Iterator<MultiGetItemResponse> iterator = response.iterator();
+                    while (iterator.hasNext()) {
+                        MultiGetItemResponse item = iterator.next();
+                        if (item.isFailed()) {
+                            logger.warn("_revs_diff get failure on index: {} id: {} message: {}", item.getIndex(), item.getId(), item.getFailure().getMessage());
+                        } else {
+                            if (item.getResponse().isExists()) {
+                                String itemId = item.getId();
+                                Map<String, Object> source = item.getResponse().getSourceAsMap();
+                                if (source != null) {
+                                    Map<String, Object> meta = (Map<String, Object>) source.get("meta");
+                                    if (meta != null) {
+                                        String rev = (String) meta.get("rev");
+                                        //retrieve the revision passed in from Couchbase
+                                        Map<String, String> sourceRevMap = (Map<String, String>) responseMap.get(itemId);
+                                        String sourceRev = sourceRevMap.get("missing");
+                                        if (rev.equals(sourceRev)) {
+                                            // if our revision is the same as the source rev
+                                            // remove it from the response map
+                                            responseMap.remove(itemId);
+                                            logger.trace("_revs_diff already have id: {} rev: {}", itemId, rev);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                } else {
+                    logger.debug("response was null");
                 }
-            } else {
-                logger.debug("response was null");
+                logger.trace("_revs_diff response AFTER conflict resolution {}", responseMap);
             }
-            logger.trace("_revs_diff response AFTER conflict resolution {}", responseMap);
-        }
 
-        long end = System.currentTimeMillis();
-        meanRevsDiffRequests.inc(end - start);
-        activeRevsDiffRequests.dec();
-        return responseMap;
+            meanRevsDiffRequests.inc(stopwatch.elapsed(MILLISECONDS));
+            return responseMap;
+        } finally {
+            activeRevsDiffRequests.dec();
+            stopwatch.stop();
+            logger.debug("exit revsDiff requestId={} database={} elapsedMs={}",
+                    requestId, database, stopwatch.elapsed(MILLISECONDS));
+            revsDiffTimer.update(stopwatch.elapsed(NANOSECONDS), NANOSECONDS);
+        }
     }
 
-    @Override
-    public List<Object> bulkDocs(String database, List<Map<String, Object>> docs) throws UnavailableException {
+    private long nextRequestId() {
+        return nextRequestId.incrementAndGet();
+    }
+
+    private void throwIfTooManyConcurrentRequests() throws UnavailableException {
         // check to see if too many requests are already active
         if(activeBulkDocsRequests.count() + activeRevsDiffRequests.count() >= pluginSettings.getMaxConcurrentRequests()) {
             totalTooManyConcurrentRequestsErrors.inc();
+            tooManyConcurrentRequestsMeter.mark();
             logger.error("Too many concurrent requests. _bulk_docs requests: {}, _revs_diff requests: {}, Max configured: {}",
                     activeBulkDocsRequests.count(),
                     activeRevsDiffRequests.count(),
                     pluginSettings.getMaxConcurrentRequests());
             throw new UnavailableException("Too many concurrent requests");
         }
+    }
 
-        long start = System.currentTimeMillis();
+    @Override
+    public List<Object> bulkDocs(String database, List<Map<String, Object>> docs) throws UnavailableException {
+        throwIfTooManyConcurrentRequests();
+
+        final long requestId = nextRequestId();
+        Stopwatch stopwatch = Stopwatch.createStarted();
         activeBulkDocsRequests.inc();
-        String index = getElasticSearchIndexNameFromDatabase(database);
+        try {
+            logger.debug("enter bulkDocs requestId={} database={}", requestId, database);
 
-		//if set to true - all delete operations will be ignored
-		//ignoreDeletes contains a list of indexes to be ignored when delete events occur
-		//index list can be set in the elasticsearch.yml file using
-		//the key: couchbase.ignore.delete  the value is colon separated:  index1:index2:index3 
-		boolean ignoreDelete = pluginSettings.getIgnoreDeletes() != null && pluginSettings.getIgnoreDeletes().contains(index);
-        logger.trace("ignoreDelete = {}", ignoreDelete);
-        
-        // keep a map of the id - rev for building the response
-        Map<String,String> revisions = new HashMap<String, String>();
+            String index = getElasticSearchIndexNameFromDatabase(database);
 
-        // put requests into this map, not directly into the bulk request
-        Map<String,IndexRequest> bulkIndexRequests = new HashMap<String,IndexRequest>();
-        Map<String,DeleteRequest> bulkDeleteRequests = new HashMap<String,DeleteRequest>();
-        
-        //used for "mock" results in case of ignore deletes or filtered out keys
-        List<Object> mockResults = new ArrayList<Object>();
+            //if set to true - all delete operations will be ignored
+            //ignoreDeletes contains a list of indexes to be ignored when delete events occur
+            //index list can be set in the elasticsearch.yml file using
+            //the key: couchbase.ignore.delete  the value is colon separated:  index1:index2:index3
+            boolean ignoreDelete = pluginSettings.getIgnoreDeletes() != null && pluginSettings.getIgnoreDeletes().contains(index);
+            logger.trace("ignoreDelete = {}", ignoreDelete);
 
-        logger.trace("Bulk doc entry is {}", docs);
-        for (Map<String, Object> doc : docs) {
+            // keep a map of the id - rev for building the response
+            Map<String, String> revisions = new HashMap<String, String>();
 
-            // these are the top-level elements that could be in the document sent by Couchbase
-            Map<String, Object> meta = (Map<String, Object>)doc.get("meta");
-            Map<String, Object> json = (Map<String, Object>)doc.get("json");
-            String base64 = (String)doc.get("base64");
+            // put requests into this map, not directly into the bulk request
+            Map<String, IndexRequest> bulkIndexRequests = new HashMap<String, IndexRequest>();
+            Map<String, DeleteRequest> bulkDeleteRequests = new HashMap<String, DeleteRequest>();
 
-            if(meta == null) {
-                // if there is no meta-data section, there is nothing we can do
-                logger.warn("Document without meta in bulk_docs, ignoring....");
-                continue;
-            }
+            //used for "mock" results in case of ignore deletes or filtered out keys
+            List<Object> mockResults = new ArrayList<Object>();
 
-            String id = (String)meta.get("id");
-            String rev = (String)meta.get("rev");
+            logger.trace("Bulk doc entry is {}", docs);
+            for (Map<String, Object> doc : docs) {
 
-            if(id == null) {
-                // if there is no id in the metadata, something is seriously wrong
-                logger.warn("Document metadata does not have an id, ignoring...");
-                continue;
-            }
+                // these are the top-level elements that could be in the document sent by Couchbase
+                Map<String, Object> meta = (Map<String, Object>) doc.get("meta");
+                Map<String, Object> json = (Map<String, Object>) doc.get("json");
+                String base64 = (String) doc.get("base64");
 
-            // Filter documents by ID.
-            // Delete operations are always allowed through to ES, to make sure newly configured
-            // filters don't cause documents to stay in ES forever.
-            if(!pluginSettings.getKeyFilter().shouldAllow(index, id) && !meta.containsKey("deleted")) {
-                // Document ID matches one of the filters, not passing it to on to ES.
-                // Store a mock response, which will be added to the responses sent back
-                // to Couchbase, to satisfy the XDCR mechanism
-                Map<String, Object> mockResponse = new HashMap<String, Object>();
-                mockResponse.put("id", id);
-                mockResponse.put("rev", rev);
-                mockResults.add(mockResponse);
+                if (meta == null) {
+                    // if there is no meta-data section, there is nothing we can do
+                    logger.warn("Document without meta in bulk_docs, ignoring....");
+                    continue;
+                }
 
-                logger.trace("Document doesn't pass configured key filters, not storing: {}", id);
-                continue;
-            }
+                String id = (String) meta.get("id");
+                String rev = (String) meta.get("rev");
 
-            if(meta.containsKey("deleted")) {
-                // if this is only a delete anyway, don't bother looking at the body
-                json = new HashMap<String, Object>();
-            } else if("non-JSON mode".equals(meta.get("att_reason")) || "invalid_json".equals(meta.get("att_reason"))) {
-                // optimization, this tells us the body isn't json
-                json = new HashMap<String, Object>();
-            } else if(json == null && base64 != null) {
-                // no plain json, let's try parsing the base64 data
-                try {
-                    byte[] decodedData = Base64.decode(base64);
-                    try {
-                        // now try to parse the decoded data as json
-                        json = (Map<String, Object>) mapper.readValue(decodedData, Map.class);
-                    }
-                    catch(IOException e) {
-                        json = new HashMap<String, Object>();
-                        if(pluginSettings.getWrapCounters()) {
-                            logger.trace("Trying to parse decoded base64 data as a long and wrap it as a counter document, id: {}", meta.get("id"));
-                            try {
-                                long value = Long.parseLong(new String(decodedData));
-                                logger.trace("Parsed data as long: {}", value);
-                                json.put("value", value);
-                            }
-                            catch(Exception e2) {
-                                logger.error("Unable to parse decoded base64 data as either JSON or long, indexing stub for id: {}", meta.get("id"));
-                                logger.error("Body was: {} Parse error was: {} Long parse error was: {}", new String(decodedData), e, e2);
-                            }
-                        }
-                        else {
-                            logger.error("Unable to parse decoded base64 data as JSON, indexing stub for id: {}", meta.get("id"));
-                            logger.error("Body was: {} Parse error was: {}", new String(decodedData), e);
-                        }
-                    }
-                } catch (IOException e) {
-                    logger.error("Unable to decoded base64, indexing stub for id: {}", meta.get("id"));
-                    logger.error("Base64 was was: {} Parse error was: {}", base64, e);
+                if (id == null) {
+                    // if there is no id in the metadata, something is seriously wrong
+                    logger.warn("Document metadata does not have an id, ignoring...");
+                    continue;
+                }
+
+                // Filter documents by ID.
+                // Delete operations are always allowed through to ES, to make sure newly configured
+                // filters don't cause documents to stay in ES forever.
+                if (!pluginSettings.getKeyFilter().shouldAllow(index, id) && !meta.containsKey("deleted")) {
+                    // Document ID matches one of the filters, not passing it to on to ES.
+                    // Store a mock response, which will be added to the responses sent back
+                    // to Couchbase, to satisfy the XDCR mechanism
+                    Map<String, Object> mockResponse = new HashMap<String, Object>();
+                    mockResponse.put("id", id);
+                    mockResponse.put("rev", rev);
+                    mockResults.add(mockResponse);
+
+                    logger.trace("Document doesn't pass configured key filters, not storing: {}", id);
+                    continue;
+                }
+
+                if (meta.containsKey("deleted")) {
+                    // if this is only a delete anyway, don't bother looking at the body
                     json = new HashMap<String, Object>();
-                }
-            }
-
-            // at this point we know we have the document meta-data
-            // and the document contents to be indexed are in json
-
-            Map<String, Object> toBeIndexed = new HashMap<String, Object>();
-            toBeIndexed.put("meta", meta);
-            toBeIndexed.put("doc", json);
-
-            revisions.put(id, rev);
-
-            long ttl = 0;
-            Integer expiration = (Integer)meta.get("expiration");
-            if(expiration != null && expiration > 0) {
-                ttl = (expiration.longValue() * 1000) - System.currentTimeMillis();
-            }
-
-            String routingField = null;
-            String type = pluginSettings.getTypeSelector().getType(index, id);
-            logger.trace("Selecting type {} for document {} in index {}", type, id, index);
-
-            if(pluginSettings.getDocumentTypeRoutingFields() != null && pluginSettings.getDocumentTypeRoutingFields().containsKey(type)) {
-                routingField = pluginSettings.getDocumentTypeRoutingFields().get(type);
-                logger.trace("Using {} as the routing field for document type {}", routingField, type);
-            }
-            boolean deleted = meta.containsKey("deleted") ? (Boolean)meta.get("deleted") : false;
-            
-            if(deleted) {
-            	if (!ignoreDelete) {
-                	DeleteRequest deleteRequest = client.prepareDelete(index, type, id).request();
-                	bulkDeleteRequests.put(id, deleteRequest);
-            	}else{
-                	// For ignored deletes, we want to bypass from adding the delete request
-            		// as a hack - we add a "mock" response for each delete request as if ES returned
-            		// delete confirmation
-	                Map<String, Object> mockResponse = new HashMap<String, Object>();
-	                mockResponse.put("id", id);
-	                mockResponse.put("rev", rev);
-	                mockResults.add(mockResponse);
-            	}
-            } else {
-                IndexRequestBuilder indexBuilder = client.prepareIndex(index, type, id);
-                indexBuilder.setSource(toBeIndexed);
-                if(!ignoreDelete && ttl > 0) {
-                    indexBuilder.setTTL(ttl);
-                }
-                Object parent = pluginSettings.getParentSelector().getParent(toBeIndexed, id, type);
-                if (parent != null) {
-                    if (parent instanceof String) {
-                        logger.debug("Setting parent of document {} to {}", id, parent);
-                        indexBuilder.setParent((String) parent);
-                    } else {
-                        logger.warn("Unable to determine parent value from parent field {} for doc id {}", parent, id);
+                } else if ("non-JSON mode".equals(meta.get("att_reason")) || "invalid_json".equals(meta.get("att_reason"))) {
+                    // optimization, this tells us the body isn't json
+                    json = new HashMap<String, Object>();
+                } else if (json == null && base64 != null) {
+                    // no plain json, let's try parsing the base64 data
+                    try {
+                        byte[] decodedData = Base64.decode(base64);
+                        try {
+                            // now try to parse the decoded data as json
+                            json = (Map<String, Object>) mapper.readValue(decodedData, Map.class);
+                        } catch (IOException e) {
+                            json = new HashMap<String, Object>();
+                            if (pluginSettings.getWrapCounters()) {
+                                logger.trace("Trying to parse decoded base64 data as a long and wrap it as a counter document, id: {}", meta.get("id"));
+                                try {
+                                    long value = Long.parseLong(new String(decodedData));
+                                    logger.trace("Parsed data as long: {}", value);
+                                    json.put("value", value);
+                                } catch (Exception e2) {
+                                    logger.error("Unable to parse decoded base64 data as either JSON or long, indexing stub for id: {}", meta.get("id"));
+                                    logger.error("Body was: {} Parse error was: {} Long parse error was: {}", new String(decodedData), e, e2);
+                                }
+                            } else {
+                                logger.error("Unable to parse decoded base64 data as JSON, indexing stub for id: {}", meta.get("id"));
+                                logger.error("Body was: {} Parse error was: {}", new String(decodedData), e);
+                            }
+                        }
+                    } catch (IOException e) {
+                        logger.error("Unable to decoded base64, indexing stub for id: {}", meta.get("id"));
+                        logger.error("Base64 was was: {} Parse error was: {}", base64, e);
+                        json = new HashMap<String, Object>();
                     }
                 }
-                if(routingField != null) {
-                    Object routing = JSONMapPath(toBeIndexed, routingField);
-                    if (routing != null && routing instanceof String) {
-                        indexBuilder.setRouting((String)routing);
+
+                // at this point we know we have the document meta-data
+                // and the document contents to be indexed are in json
+
+                Map<String, Object> toBeIndexed = new HashMap<String, Object>();
+                toBeIndexed.put("meta", meta);
+                toBeIndexed.put("doc", json);
+
+                revisions.put(id, rev);
+
+                long ttl = 0;
+                Integer expiration = (Integer) meta.get("expiration");
+                if (expiration != null && expiration > 0) {
+                    ttl = (expiration.longValue() * 1000) - System.currentTimeMillis();
+                }
+
+                String routingField = null;
+                String type = pluginSettings.getTypeSelector().getType(index, id);
+                logger.trace("Selecting type {} for document {} in index {}", type, id, index);
+
+                if (pluginSettings.getDocumentTypeRoutingFields() != null && pluginSettings.getDocumentTypeRoutingFields().containsKey(type)) {
+                    routingField = pluginSettings.getDocumentTypeRoutingFields().get(type);
+                    logger.trace("Using {} as the routing field for document type {}", routingField, type);
+                }
+                boolean deleted = meta.containsKey("deleted") ? (Boolean) meta.get("deleted") : false;
+
+                if (deleted) {
+                    if (!ignoreDelete) {
+                        DeleteRequest deleteRequest = client.prepareDelete(index, type, id).request();
+                        bulkDeleteRequests.put(id, deleteRequest);
                     } else {
-                        logger.warn("Unable to determine routing value from routing field {} for doc id {}", routingField, id);
+                        // For ignored deletes, we want to bypass from adding the delete request
+                        // as a hack - we add a "mock" response for each delete request as if ES returned
+                        // delete confirmation
+                        Map<String, Object> mockResponse = new HashMap<String, Object>();
+                        mockResponse.put("id", id);
+                        mockResponse.put("rev", rev);
+                        mockResults.add(mockResponse);
+                    }
+                } else {
+                    IndexRequestBuilder indexBuilder = client.prepareIndex(index, type, id);
+                    indexBuilder.setSource(toBeIndexed);
+                    if (!ignoreDelete && ttl > 0) {
+                        indexBuilder.setTTL(ttl);
+                    }
+                    Object parent = pluginSettings.getParentSelector().getParent(toBeIndexed, id, type);
+                    if (parent != null) {
+                        if (parent instanceof String) {
+                            logger.debug("Setting parent of document {} to {}", id, parent);
+                            indexBuilder.setParent((String) parent);
+                        } else {
+                            logger.warn("Unable to determine parent value from parent field {} for doc id {}", parent, id);
+                        }
+                    }
+                    if (routingField != null) {
+                        Object routing = JSONMapPath(toBeIndexed, routingField);
+                        if (routing != null && routing instanceof String) {
+                            indexBuilder.setRouting((String) routing);
+                        } else {
+                            logger.warn("Unable to determine routing value from routing field {} for doc id {}", routingField, id);
+                        }
+                    }
+                    IndexRequest indexRequest = indexBuilder.request();
+                    bulkIndexRequests.put(id, indexRequest);
+                }
+            }
+
+            int attempt = 0;
+            BulkResponse response = null;
+            List<Object> result;
+            long retriesLeft = pluginSettings.getBulkIndexRetries();
+            StringBuilder errors = new StringBuilder();
+            BulkRequestBuilder bulkBuilder;
+
+            do {
+                // build the bulk request for this iteration
+                bulkBuilder = client.prepareBulk();
+                for (Entry<String, IndexRequest> entry : bulkIndexRequests.entrySet()) {
+                    bulkBuilder.add(entry.getValue());
+                }
+                for (Entry<String, DeleteRequest> entry : bulkDeleteRequests.entrySet()) {
+                    bulkBuilder.add(entry.getValue());
+                }
+
+                attempt++;
+                result = new ArrayList<Object>();
+
+                if (response != null) {
+                    // at least second time through
+                    try {
+                        Thread.sleep(pluginSettings.getBulkIndexRetryWaitMs());
+                    } catch (InterruptedException e) {
+                        errors.append(e.toString());
+                        break;
                     }
                 }
-                IndexRequest indexRequest = indexBuilder.request();
-                bulkIndexRequests.put(id,  indexRequest);
-            }
-        }
 
-        int attempt = 0;
-        BulkResponse response = null;
-        List<Object> result;
-        long retriesLeft = pluginSettings.getBulkIndexRetries();
-        StringBuilder errors = new StringBuilder();
-        BulkRequestBuilder bulkBuilder;
-
-        do {
-            // build the bulk request for this iteration
-            bulkBuilder = client.prepareBulk();
-            for (Entry<String,IndexRequest> entry : bulkIndexRequests.entrySet()) {
-                bulkBuilder.add(entry.getValue());
-            }
-            for (Entry<String,DeleteRequest> entry : bulkDeleteRequests.entrySet()) {
-                bulkBuilder.add(entry.getValue());
-            }
-
-            attempt++;
-            result = new ArrayList<Object>();
-
-            if(response != null) {
-                // at least second time through
-                try {
-                    Thread.sleep(pluginSettings.getBulkIndexRetryWaitMs());
-                } catch (InterruptedException e) {
-                    errors.append(e.toString());
+                if (bulkBuilder.numberOfActions() > 0)
+                    response = bulkBuilder.execute().actionGet();
+                else
                     break;
-                }
-            }
-            
-            if(bulkBuilder.numberOfActions() > 0)
-	            response = bulkBuilder.execute().actionGet();
-            else
-                break;
-            
-            if(response != null) {
-                for (BulkItemResponse bulkItemResponse : response.getItems()) {
-                    String itemId = bulkItemResponse.getId();
-                    String itemRev = revisions.get(itemId);
 
-                    if(!bulkItemResponse.isFailed()) {
-                        Map<String, Object> itemResponse = new HashMap<String, Object>();
-                        itemResponse.put("id", itemId);
-                        itemResponse.put("rev", itemRev);
-                        result.add(itemResponse);
+                if (response != null) {
+                    for (BulkItemResponse bulkItemResponse : response.getItems()) {
+                        String itemId = bulkItemResponse.getId();
+                        String itemRev = revisions.get(itemId);
 
-                        // remove the item from the bulk requests list so we don't try to index it again
-                        bulkIndexRequests.remove(itemId);
-                        bulkDeleteRequests.remove(itemId);
-                    } else {
-                        Failure failure = bulkItemResponse.getFailure();
+                        if (!bulkItemResponse.isFailed()) {
+                            Map<String, Object> itemResponse = new HashMap<String, Object>();
+                            itemResponse.put("id", itemId);
+                            itemResponse.put("rev", itemRev);
+                            result.add(itemResponse);
 
-                        // If the error is fatal, don't retry the request.
-                        if(failureMessageAppearsFatal(failure.getMessage())) {
-                            logger.error("error indexing document id: " + itemId + " exception: " + failure.getMessage());
-
+                            // remove the item from the bulk requests list so we don't try to index it again
                             bulkIndexRequests.remove(itemId);
                             bulkDeleteRequests.remove(itemId);
+                        } else {
+                            Failure failure = bulkItemResponse.getFailure();
 
-                            // If ignore failures mode is on, store a mock result object for the failed
-                            // operation, which will be returned to Couchbase.
-                            if(pluginSettings.getIgnoreFailures()) {
-                                Map<String, Object> mockResult = new HashMap<String, Object>();
-                                mockResult.put("id", itemId);
-                                mockResult.put("rev", itemRev);
-                                mockResults.add(mockResult);
-                            }
-                            else {
-                                errors.append(failure.getMessage());
-                                errors.append(System.lineSeparator());
+                            // If the error is fatal, don't retry the request.
+                            if (failureMessageAppearsFatal(failure.getMessage())) {
+                                logger.error("error indexing document id: " + itemId + " exception: " + failure.getMessage());
+
+                                bulkIndexRequests.remove(itemId);
+                                bulkDeleteRequests.remove(itemId);
+
+                                // If ignore failures mode is on, store a mock result object for the failed
+                                // operation, which will be returned to Couchbase.
+                                if (pluginSettings.getIgnoreFailures()) {
+                                    Map<String, Object> mockResult = new HashMap<String, Object>();
+                                    mockResult.put("id", itemId);
+                                    mockResult.put("rev", itemRev);
+                                    mockResults.add(mockResult);
+                                } else {
+                                    errors.append(failure.getMessage());
+                                    errors.append(System.lineSeparator());
+                                }
                             }
                         }
                     }
                 }
+                retriesLeft--;
+            } while (response != null && response.hasFailures() && retriesLeft > 0);
+
+            meanBulkDocsRequests.inc(stopwatch.elapsed(MILLISECONDS));
+
+            if (response == null && bulkBuilder != null && bulkBuilder.numberOfActions() > 0)
+                errors.append("indexing error: bulk index response was null" + System.lineSeparator());
+            if (retriesLeft == 0)
+                errors.append("indexing error: bulk index failed after all retries" + System.lineSeparator());
+
+            if (errors.length() > 0) {
+                if (pluginSettings.getIgnoreFailures()) {
+                    logger.error("bulk index requestId={} Ignoring failures: {}", requestId, errors);
+                } else {
+                    logger.error("bulk index requestId={} Failing due to errors: {}", requestId, errors);
+                    throw new RuntimeException(errors.toString());
+                }
+            } else {
+                logger.info("bulk index requestId={} succeeded after {} tries", requestId, attempt);
             }
-            retriesLeft--;
-        } while(response != null && response.hasFailures() && retriesLeft > 0);
 
-        long end = System.currentTimeMillis();
-        meanBulkDocsRequests.inc(end - start);
-        activeBulkDocsRequests.dec();
+            // Before we return, in case of ignore delete or filtered keys
+            // we want to add the "mock" confirmations for the ignored operations
+            // in order to satisfy the XDCR mechanism
+            if (mockResults != null && mockResults.size() > 0)
+                result.addAll(mockResults);
 
-        if(response == null && bulkBuilder != null && bulkBuilder.numberOfActions() > 0)
-            errors.append("indexing error: bulk index response was null" + System.lineSeparator());
-        if(retriesLeft == 0)
-            errors.append("indexing error: bulk index failed after all retries" + System.lineSeparator());
-
-        if(errors.length() > 0)
-            if(pluginSettings.getIgnoreFailures())
-                logger.error(errors.toString());
-            else
-                throw new RuntimeException(errors.toString());
-        else
-            logger.info("bulk index succeeded after {} tries", attempt);
-
-        // Before we return, in case of ignore delete or filtered keys
-        // we want to add the "mock" confirmations for the ignored operations
-        // in order to satisfy the XDCR mechanism
-        if(mockResults != null && mockResults.size() > 0)
-        	result.addAll(mockResults);
-
-        return result;
+            return result;
+        } finally {
+            activeBulkDocsRequests.dec();
+            stopwatch.stop();
+            logger.debug("exit bulkDocs requestId={} database={} elapsedMs={}",
+                    requestId, database, stopwatch.elapsed(MILLISECONDS));
+            bulkDocsTimer.update(stopwatch.elapsed(NANOSECONDS), NANOSECONDS);
+        }
     }
 
     public boolean failureMessageAppearsFatal(String failureMessage) {
@@ -639,6 +668,12 @@ public class ElasticSearchCAPIBehavior implements CAPIBehavior {
         return database;
     }
 
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    static {
+        mapper.registerModule(new MetricsModule(SECONDS, MILLISECONDS, true));
+    }
+
     public Map<String, Object> getStats() {
         Map<String, Object> stats = new HashMap<String, Object>();
 
@@ -658,6 +693,7 @@ public class ElasticSearchCAPIBehavior implements CAPIBehavior {
         stats.put("_revs_diff", revsDiffStats);
         stats.put("tooManyConcurrentRequestsErrors", totalTooManyConcurrentRequestsErrors.count());
 
+        stats.put("metrics", mapper.convertValue(metricRegistry, Map.class));
         return stats;
     }
 

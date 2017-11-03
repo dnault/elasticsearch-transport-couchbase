@@ -671,7 +671,7 @@ public class ElasticSearchCAPIBehavior implements CAPIBehavior {
     private static final ObjectMapper mapper = new ObjectMapper();
 
     static {
-        mapper.registerModule(new MetricsModule(SECONDS, MILLISECONDS, true));
+        mapper.registerModule(new MetricsModule(SECONDS, MILLISECONDS, false));
     }
 
     public Map<String, Object> getStats() {
